@@ -1,0 +1,14 @@
+# Checkpoints & weights
+checkpoints/
+*.pt
+*.pth
+
+# Datasets & cloned baseline repos
+PopBias/Data/
+PopBias/Baselines/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
