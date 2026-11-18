@@ -29,7 +29,7 @@ def load_frozen_teacher(ckpt_path, adj, num_users, device):
     return emb[:num_users], emb[num_users:]
 
 
-def kd_third_teacher(u, cand_items, u_stu, i_stu, u_good, i_good, u_evil, i_evil, gamma, tau):
+def kd_third_teacher(u, cand_items, u_stu, i_stu, u_good, i_good, u_evil, i_evil, gamma, tau, scale_teachers=False):
     """
     Distills evil-referenced teacher scores: s_ref = s_good - gamma * s_evil
     into the student over candidate items [B, M].
@@ -39,6 +39,9 @@ def kd_third_teacher(u, cand_items, u_stu, i_stu, u_good, i_good, u_evil, i_evil
     with torch.no_grad():
         s_good = torch.bmm(i_good[cand_items], u_good[u].unsqueeze(-1)).squeeze(-1)
         s_evil = torch.bmm(i_evil[cand_items], u_evil[u].unsqueeze(-1)).squeeze(-1)
+        if scale_teachers:
+            s_good = (s_good - s_good.mean(dim=-1, keepdim=True)) / s_good.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            s_evil = (s_evil - s_evil.mean(dim=-1, keepdim=True)) / s_evil.std(dim=-1, keepdim=True).clamp(min=1e-6)
         s_ref = s_good - gamma * s_evil
         p_ref = F.softmax(s_ref / tau, dim=-1)
 
@@ -145,7 +148,8 @@ def train_student(args):
                 rand_cands = torch.randint(0, num_items, (len(u), args.num_cands), device=device)
                 cand_items = torch.cat([pos_i.unsqueeze(1), neg_i.unsqueeze(1), rand_cands], dim=1)
                 kd_loss = kd_third_teacher(
-                    u, cand_items, u_e, i_all_stu, u_good, i_good, u_evil, i_evil, args.gamma, args.tau
+                    u, cand_items, u_e, i_all_stu, u_good, i_good, u_evil, i_evil,
+                    args.gamma, args.tau, scale_teachers=args.scale_teachers,
                 )
             elif args.method == "contrastive":
                 kd_loss = kd_contrastive(u, u_e, u_good, u_evil, args.tau)
@@ -208,6 +212,7 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.5, help="Evil subtraction weight for third_teacher")
     parser.add_argument("--tau", type=float, default=0.2, help="Temperature for KD / InfoNCE")
     parser.add_argument("--num_cands", type=int, default=32, help="Extra random candidates per batch for third_teacher")
+    parser.add_argument("--scale_teachers", action="store_true", help="Z-score s_good and s_evil per user before subtracting")
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)

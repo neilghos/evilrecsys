@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--data_root", type=str, default="PopBias/Baselines/LightGCN-PyTorch/data")
     parser.add_argument("--fair_data_root", type=str, default="PopBias/Data")
     parser.add_argument("--topk", type=int, default=20)
+    parser.add_argument("--tten_alpha", type=float, default=0.0, help="TTEN test-time item norm exponent (0=off)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,6 +38,8 @@ def main():
 
     emb = model(adj)
     u_emb, i_emb = emb[:num_users], emb[num_users:]
+    if args.tten_alpha > 0:
+        i_emb = i_emb / i_emb.norm(dim=-1, keepdim=True).clamp(min=1e-8).pow(args.tten_alpha)
 
     res_iid = evaluate_cf(u_emb, i_emb, data["train_sets"], data["test_sets"], data["item_pop"], k=args.topk)
     print("IID :", " ".join(f"{k}={v:.4f}" for k, v in res_iid.items()))
