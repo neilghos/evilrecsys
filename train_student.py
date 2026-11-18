@@ -12,22 +12,6 @@ from metrics import evaluate_cf
 from train_evil import FastLightGCNSampler, _maybe_to_csr
 
 
-class ScoreDiscriminator(nn.Module):
-    """Lightweight MLP discriminator for Adversarial KD."""
-    def __init__(self, in_dim, hidden_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
 @torch.no_grad()
 def load_frozen_teacher(ckpt_path, adj, num_users, device):
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -110,12 +94,6 @@ def train_student(args):
     student = EvilLightGCN(num_nodes=num_nodes, embedding_dim=args.dim, num_layers=args.layers).to(device)
     optimizer = torch.optim.Adam(student.parameters(), lr=args.lr)
 
-    disc = None
-    disc_opt = None
-    if args.method == "adversarial":
-        disc = ScoreDiscriminator(args.dim).to(device)
-        disc_opt = torch.optim.Adam(disc.parameters(), lr=args.lr)
-
     sampler = FastLightGCNSampler(
         data["train_sets"], num_users, num_items, data["item_pop"], device=device, alpha=0.0
     )
@@ -171,21 +149,6 @@ def train_student(args):
                 )
             elif args.method == "contrastive":
                 kd_loss = kd_contrastive(u, u_e, u_good, u_evil, args.tau)
-            elif args.method == "adversarial":
-                # Step 1: train discriminator to separate Evil (1) from Good/Non-Evil (0)
-                d_evil = disc(u_evil[u])
-                d_good = disc(u_good[u])
-                d_loss = 0.5 * (
-                    F.binary_cross_entropy_with_logits(d_evil, torch.ones_like(d_evil))
-                    + F.binary_cross_entropy_with_logits(d_good, torch.zeros_like(d_good))
-                )
-                disc_opt.zero_grad()
-                d_loss.backward()
-                disc_opt.step()
-
-                # Step 2: student pushes its user representation to the non-evil side (0)
-                d_stu = disc(u_e)
-                kd_loss = F.binary_cross_entropy_with_logits(d_stu, torch.zeros_like(d_stu))
             else:
                 raise ValueError(f"Unknown method: {args.method}")
 
@@ -240,7 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018"])
     parser.add_argument("--good_ckpt", type=str, default="checkpoints/baseline_gowalla.pt")
     parser.add_argument("--evil_ckpt", type=str, default="checkpoints/evil_a1.0_b1.0_gowalla.pt")
-    parser.add_argument("--method", type=str, default="third_teacher", choices=["third_teacher", "contrastive", "adversarial"])
+    parser.add_argument("--method", type=str, default="third_teacher", choices=["third_teacher", "contrastive"])
     parser.add_argument("--kd_weight", type=float, default=0.5)
     parser.add_argument("--gamma", type=float, default=0.5, help="Evil subtraction weight for third_teacher")
     parser.add_argument("--tau", type=float, default=0.2, help="Temperature for KD / InfoNCE")
