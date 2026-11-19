@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from dataloaders import build_sparse_adj_matrix, load_cf_txt_dataset
 from evil_model import EvilLightGCN
+from logger import RunLogger
 from metrics import evaluate_cf
 
 
@@ -121,10 +122,13 @@ def train_evil(args):
     pop_weights = (data["item_pop"] / data["item_pop"].mean().clamp(min=1.0)).pow(args.beta).to(device)
 
     mode = "Baseline-LightGCN" if (args.alpha == 0.0 and args.beta == 0.0) else f"Evil-LightGCN(a={args.alpha},b={args.beta})"
-    print(
+    tag = "baseline" if (args.alpha == 0.0 and args.beta == 0.0) else f"evil_a{args.alpha}_b{args.beta}"
+    logger = RunLogger(f"{tag}_{args.dataset}", args.dataset, mode)
+    logger.info(
         f"[{mode}] dataset={args.dataset} users={num_users} items={num_items} "
         f"layers={args.layers} lr={args.lr} decay={args.reg} device={device}"
     )
+    last_res = None
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -190,13 +194,15 @@ def train_evil(args):
                     adapter=None,
                     k=args.topk,
                 )
-            metrics_str = " ".join(f"{k}={v:.4f}" for k, v in res.items())
-            print(f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} | {metrics_str}")
+            last_res = res
+            logger.log_epoch(epoch, dt, avg_loss, res)
         else:
-            print(f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f}")
+            logger.log_epoch(epoch, dt, avg_loss)
+
+    if last_res is not None:
+        logger.log_summary(last_res, tag="final")
 
     os.makedirs(args.save_dir, exist_ok=True)
-    tag = "baseline" if (args.alpha == 0.0 and args.beta == 0.0) else f"evil_a{args.alpha}_b{args.beta}"
     ckpt_path = os.path.join(args.save_dir, f"{tag}_{args.dataset}.pt")
     torch.save(
         {
@@ -214,7 +220,7 @@ def train_evil(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Baseline or Evil LightGCN (exact LightGCN-PyTorch setup)")
     parser.add_argument("--data_root", type=str, default="PopBias/Data")
-    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018"])
+    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m"])
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)

@@ -1,7 +1,11 @@
 # Checkpoints & weights
-checkpoints/
+checkpoints*/
 *.pt
 *.pth
+
+# Logs & CSV results
+logs/
+results/
 
 # Datasets & cloned baseline repos
 PopBias/Data/

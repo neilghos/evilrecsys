@@ -7,8 +7,9 @@ import torch.nn.functional as F
 
 from dataloaders import build_sparse_adj_matrix, load_cf_txt_dataset
 from evil_model import EvilLightGCN
+from logger import RunLogger
 from metrics import evaluate_cf
-from third_teacher import VALID_REF_MODES, build_third_teacher, compute_ref_scores, load_frozen_teacher
+from teacher import VALID_REF_MODES, build_third_teacher, compute_ref_scores, load_frozen_teacher
 from train_evil import FastLightGCNSampler, _maybe_to_csr
 
 
@@ -46,7 +47,6 @@ def kd_third_teacher(u, cand_items, u_stu, i_stu, tt, ref_mode, gamma, tau, scal
             std_g=tt["std_g"][u],
             mean_e=tt["mean_e"][u],
             std_e=tt["std_e"][u],
-            beta_u=tt["beta_u"][u],
         )
         if scale_student:
             s_ref = _zscore(s_ref)
@@ -102,9 +102,12 @@ def train_student(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_recall = -1.0
+    best_res = None
+    last_res = None
     best_ckpt_path = os.path.join(args.save_dir, f"student_third_teacher_{args.dataset}_best.pt")
 
-    print(
+    logger = RunLogger(f"student_{args.ref_mode}_g{args.gamma}_{args.dataset}", args.dataset, f"Student-{args.ref_mode}")
+    logger.info(
         f"[Student-ThirdTeacher] dataset={args.dataset} ref_mode={args.ref_mode} "
         f"gamma={args.gamma} kd_weight={args.kd_weight} bpr_weight={args.bpr_weight} "
         f"tau={args.tau} scale_student={args.scale_student} device={device}"
@@ -203,20 +206,26 @@ def train_student(args):
                         fair_data["item_pop"],
                         k=args.topk,
                     )
-                    fair_str = " ".join(f"{k}={v:.4f}" for k, v in res_fair.items())
-                    msg = f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f} | IID: {main_str} | Fair: {fair_str}"
+                    last_res = res_fair
                     tracked_recall = res_fair[f"Recall@{args.topk}"]
+                    logger.log_epoch(epoch, dt, avg_loss, res_fair, extra=f"kd={avg_kd:.4f}")
                 else:
-                    msg = f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f} | Eval: {main_str}"
+                    last_res = res_main
                     tracked_recall = res_main[f"Recall@{args.topk}"]
+                    logger.log_epoch(epoch, dt, avg_loss, res_main, extra=f"kd={avg_kd:.4f}")
 
                 if tracked_recall > best_recall:
                     best_recall = tracked_recall
+                    best_res = last_res
                     torch.save({"state_dict": student.state_dict(), "args": vars(args)}, best_ckpt_path)
-                    msg += " *"
-                print(msg)
+                    logger.info(f"  -> New best Recall@{args.topk}={best_recall:.4f} saved to {best_ckpt_path}")
         else:
-            print(f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f}")
+            logger.log_epoch(epoch, dt, avg_loss, extra=f"kd={avg_kd:.4f}")
+
+    if last_res is not None:
+        logger.log_summary(last_res, tag="final")
+    if best_res is not None:
+        logger.log_summary(best_res, tag="best")
 
     ckpt_path = os.path.join(args.save_dir, f"student_third_teacher_{args.dataset}.pt")
     torch.save({"state_dict": student.state_dict(), "args": vars(args)}, ckpt_path)
@@ -227,11 +236,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Debiased Student with Third-Teacher KD")
     parser.add_argument("--data_root", type=str, default="PopBias/Data")
     parser.add_argument("--fair_data_root", type=str, default="")
-    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018"])
+    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m"])
     parser.add_argument("--good_ckpt", type=str, default="checkpoints_fair_2k/baseline_gowalla.pt")
     parser.add_argument("--evil_ckpt", type=str, default="checkpoints_fair_2k/evil_a1.0_b1.0_gowalla.pt")
-    parser.add_argument("--ref_mode", type=str, default="orth", choices=list(VALID_REF_MODES))
-    parser.add_argument("--gamma", type=float, default=1.0, help="Evil subtraction weight for Third Teacher")
+    parser.add_argument("--ref_mode", type=str, default="swiglu", choices=list(VALID_REF_MODES))
+    parser.add_argument("--gamma", type=float, default=1.2, help="Evil subtraction weight for Third Teacher")
     parser.add_argument("--tau", type=float, default=0.2, help="Temperature for Third-Teacher KL")
     parser.add_argument("--kd_weight", type=float, default=1.5)
     parser.add_argument("--bpr_weight", type=float, default=0.5)

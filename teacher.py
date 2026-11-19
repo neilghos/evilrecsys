@@ -6,7 +6,7 @@ from evil_model import EvilLightGCN
 from metrics import _load_tten_metrics, _tail_item_mask
 
 
-VALID_REF_MODES = ("raw", "zscore", "orth", "silu", "swiglu")
+VALID_REF_MODES = ("silu", "swiglu")
 
 
 @torch.no_grad()
@@ -14,8 +14,9 @@ def load_frozen_teacher(ckpt_path, adj, num_users, device):
     """Loads a frozen EvilLightGCN checkpoint and returns (u_emb, i_emb)."""
     ckpt = torch.load(ckpt_path, map_location=device)
     c_args = ckpt["args"]
+    num_nodes = ckpt.get("num_nodes", ckpt["state_dict"]["embedding.weight"].size(0))
     teacher = EvilLightGCN(
-        num_nodes=ckpt["num_nodes"],
+        num_nodes=num_nodes,
         embedding_dim=c_args["dim"],
         num_layers=c_args["layers"],
     ).to(device)
@@ -36,34 +37,14 @@ def _mask_seen_items_(scores, user_ids, train_sets):
             scores[row_idx, list(seen)] = -1e9
 
 
-def compute_ref_scores(
-    s_good,
-    s_evil,
-    ref_mode,
-    gamma,
-    mean_g=None,
-    std_g=None,
-    mean_e=None,
-    std_e=None,
-    beta_u=None,
-):
+def compute_ref_scores(s_good, s_evil, ref_mode, gamma, mean_g, std_g, mean_e, std_e):
     """
-    Computes Third-Teacher scores from (s_good, s_evil) for linear or gated modes:
-      - raw:    s_good - gamma * s_evil
-      - zscore: z(s_good) - gamma * z(s_evil)
-      - orth:   s_good - gamma * beta_u * s_evil
+    Computes gated Third-Teacher scores from standardized (s_good, s_evil):
       - silu:   z(s_good) - gamma * SiLU(z(s_evil))
       - swiglu: z(s_good) - gamma * z(s_evil) * sigmoid(z(s_evil) - z(s_good))
     """
-    if ref_mode == "raw":
-        return s_good - gamma * s_evil
-    if ref_mode == "orth":
-        return s_good - (gamma * beta_u.unsqueeze(1)) * s_evil
-
     zg = (s_good - mean_g.unsqueeze(1)) / std_g.unsqueeze(1)
     ze = (s_evil - mean_e.unsqueeze(1)) / std_e.unsqueeze(1)
-    if ref_mode == "zscore":
-        return zg - gamma * ze
     if ref_mode == "silu":
         return zg - gamma * F.silu(ze)
     if ref_mode == "swiglu":
@@ -77,16 +58,16 @@ def build_third_teacher(
     i_good,
     u_evil,
     i_evil,
-    ref_mode="orth",
-    gamma=0.8,
+    ref_mode="swiglu",
+    gamma=1.2,
     train_sets=None,
     topk_ref=0,
     topk_evil=0,
     batch_size=1024,
 ):
     """
-    Computes exact full-catalog per-user statistics for the Third Teacher and
-    optionally mines top-K hard candidates (ref_topk, evil_topk) per user.
+    Computes exact full-catalog per-user statistics for the gated Third Teacher
+    and optionally mines top-K hard candidates (ref_topk, evil_topk) per user.
     """
     if ref_mode not in VALID_REF_MODES:
         raise ValueError(f"Unsupported ref_mode: {ref_mode}")
@@ -98,7 +79,6 @@ def build_third_teacher(
     std_g = torch.empty(num_users, device=device)
     mean_e = torch.empty(num_users, device=device)
     std_e = torch.empty(num_users, device=device)
-    beta_u = torch.empty(num_users, device=device)
 
     for start in range(0, num_users, batch_size):
         end = min(start + batch_size, num_users)
@@ -109,12 +89,10 @@ def build_third_teacher(
         dg = s_g - mg.unsqueeze(1)
         de = s_e - me.unsqueeze(1)
 
-        v_e = de.pow(2).mean(dim=1).clamp(min=1e-6)
         mean_g[start:end] = mg
         mean_e[start:end] = me
         std_g[start:end] = dg.pow(2).mean(dim=1).sqrt().clamp(min=1e-6)
-        std_e[start:end] = v_e.sqrt().clamp(min=1e-6)
-        beta_u[start:end] = ((dg * de).mean(dim=1) / v_e).clamp(min=0.0)
+        std_e[start:end] = de.pow(2).mean(dim=1).sqrt().clamp(min=1e-6)
 
     ref_topk = (
         torch.empty((num_users, topk_ref), dtype=torch.long, device=device)
@@ -135,10 +113,14 @@ def build_third_teacher(
                 s_g = torch.matmul(u_good[start:end], i_good.t())
                 s_e = torch.matmul(u_evil[start:end], i_evil.t())
                 s_ref = compute_ref_scores(
-                    s_g, s_e, ref_mode, gamma,
-                    mean_g=mean_g[start:end], std_g=std_g[start:end],
-                    mean_e=mean_e[start:end], std_e=std_e[start:end],
-                    beta_u=beta_u[start:end],
+                    s_g,
+                    s_e,
+                    ref_mode,
+                    gamma,
+                    mean_g[start:end],
+                    std_g[start:end],
+                    mean_e[start:end],
+                    std_e[start:end],
                 )
                 _mask_seen_items_(s_ref, user_ids, train_sets)
                 ref_topk[start:end] = torch.topk(s_ref, k=topk_ref, dim=1).indices
@@ -157,7 +139,6 @@ def build_third_teacher(
         "std_g": std_g,
         "mean_e": mean_e,
         "std_e": std_e,
-        "beta_u": beta_u,
         "ref_topk": ref_topk,
         "evil_topk": evil_topk,
     }
@@ -165,7 +146,7 @@ def build_third_teacher(
 
 @torch.no_grad()
 def evaluate_third_teacher(tt, train_sets, test_sets, item_pop, ref_mode, gamma, k=20, batch_size=1024):
-    """Evaluates any linear or gated Third Teacher directly via TTEN's official evaluator."""
+    """Evaluates a gated Third Teacher directly via TTEN's official evaluator."""
     tten_metrics = _load_tten_metrics()
     device = tt["i_good"].device
     tail_mask = _tail_item_mask(item_pop).to(device)
@@ -182,10 +163,14 @@ def evaluate_third_teacher(tt, train_sets, test_sets, item_pop, ref_mode, gamma,
         s_g = torch.matmul(tt["u_good"][u_t], tt["i_good"].t())
         s_e = torch.matmul(tt["u_evil"][u_t], tt["i_evil"].t())
         scores = compute_ref_scores(
-            s_g, s_e, ref_mode, gamma,
-            mean_g=tt["mean_g"][u_t], std_g=tt["std_g"][u_t],
-            mean_e=tt["mean_e"][u_t], std_e=tt["std_e"][u_t],
-            beta_u=tt["beta_u"][u_t],
+            s_g,
+            s_e,
+            ref_mode,
+            gamma,
+            tt["mean_g"][u_t],
+            tt["std_g"][u_t],
+            tt["mean_e"][u_t],
+            tt["std_e"][u_t],
         )
         _mask_seen_items_(scores, batch_u, train_sets)
 
