@@ -136,7 +136,7 @@ class StudentKDTrainer:
         )
         return best_mode, best_gamma, best_res
 
-    def train(self, good_ckpt, evil_ckpt, ckpt_path, adj_evil=None, select_metric=None, auto_select=False):
+    def train(self, good_ckpt, evil_ckpt, ckpt_path, adj_evil=None, select_metric=None, auto_select=False, evil_embs=None):
         args = self.args
         seed_everything(args.seed)
 
@@ -151,7 +151,10 @@ class StudentKDTrainer:
         adj_e = adj_good if adj_evil is None else adj_evil
 
         u_good, i_good = load_frozen_teacher(good_ckpt, adj_good, num_users, self.device)
-        u_evil, i_evil = load_frozen_teacher(evil_ckpt, adj_e, num_users, self.device)
+        if evil_embs is not None:
+            u_evil, i_evil = evil_embs
+        else:
+            u_evil, i_evil = load_frozen_teacher(evil_ckpt, adj_e, num_users, self.device)
 
         if auto_select:
             ref_mode, gamma, neutral_res = self.select_best_teacher(
