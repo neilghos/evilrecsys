@@ -7,9 +7,9 @@ checkpoints*/
 logs/
 results/
 
-# Datasets & cloned baseline repos
-PopBias/Data/
-PopBias/Baselines/
+# Datasets & cloned baseline repos across all bias folders
+*/Data/
+*/Baselines/
 
 # Python cache
 __pycache__/

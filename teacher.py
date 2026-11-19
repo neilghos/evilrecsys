@@ -1,9 +1,7 @@
-import numpy as np
 import torch
 import torch.nn.functional as F
 
-from evil_model import EvilLightGCN
-from metrics import _load_tten_metrics, _tail_item_mask
+from evil_model import LightGCN
 
 
 VALID_REF_MODES = ("silu", "swiglu")
@@ -11,11 +9,11 @@ VALID_REF_MODES = ("silu", "swiglu")
 
 @torch.no_grad()
 def load_frozen_teacher(ckpt_path, adj, num_users, device):
-    """Loads a frozen EvilLightGCN checkpoint and returns (u_emb, i_emb)."""
+    """Loads a frozen LightGCN checkpoint and returns (u_emb, i_emb)."""
     ckpt = torch.load(ckpt_path, map_location=device)
     c_args = ckpt["args"]
     num_nodes = ckpt.get("num_nodes", ckpt["state_dict"]["embedding.weight"].size(0))
-    teacher = EvilLightGCN(
+    teacher = LightGCN(
         num_nodes=num_nodes,
         embedding_dim=c_args["dim"],
         num_layers=c_args["layers"],
@@ -28,18 +26,18 @@ def load_frozen_teacher(ckpt_path, adj, num_users, device):
     return emb[:num_users], emb[num_users:]
 
 
-def _mask_seen_items_(scores, user_ids, train_sets):
-    if train_sets is None:
+def _mask_seen_items_(scores, user_ids, mask_sets):
+    if mask_sets is None:
         return
     for row_idx, u in enumerate(user_ids):
-        seen = train_sets.get(u)
+        seen = mask_sets.get(u)
         if seen:
             scores[row_idx, list(seen)] = -1e9
 
 
 def compute_ref_scores(s_good, s_evil, ref_mode, gamma, mean_g, std_g, mean_e, std_e):
     """
-    Computes gated Third-Teacher scores from standardized (s_good, s_evil):
+    Computes gated Neutral-Teacher scores from standardized (s_good, s_evil):
       - silu:   z(s_good) - gamma * SiLU(z(s_evil))
       - swiglu: z(s_good) - gamma * z(s_evil) * sigmoid(z(s_evil) - z(s_good))
     """
@@ -60,13 +58,13 @@ def build_third_teacher(
     i_evil,
     ref_mode="swiglu",
     gamma=1.2,
-    train_sets=None,
+    mask_sets=None,
     topk_ref=0,
     topk_evil=0,
     batch_size=1024,
 ):
     """
-    Computes exact full-catalog per-user statistics for the gated Third Teacher
+    Computes exact full-catalog per-user statistics for the gated Neutral Teacher
     and optionally mines top-K hard candidates (ref_topk, evil_topk) per user.
     """
     if ref_mode not in VALID_REF_MODES:
@@ -122,12 +120,12 @@ def build_third_teacher(
                     mean_e[start:end],
                     std_e[start:end],
                 )
-                _mask_seen_items_(s_ref, user_ids, train_sets)
+                _mask_seen_items_(s_ref, user_ids, mask_sets)
                 ref_topk[start:end] = torch.topk(s_ref, k=topk_ref, dim=1).indices
 
             if evil_topk is not None:
                 s_e = torch.matmul(u_evil[start:end], i_evil.t())
-                _mask_seen_items_(s_e, user_ids, train_sets)
+                _mask_seen_items_(s_e, user_ids, mask_sets)
                 evil_topk[start:end] = torch.topk(s_e, k=topk_evil, dim=1).indices
 
     return {
@@ -144,25 +142,13 @@ def build_third_teacher(
     }
 
 
-@torch.no_grad()
-def evaluate_third_teacher(tt, train_sets, test_sets, item_pop, ref_mode, gamma, k=20, batch_size=1024):
-    """Evaluates a gated Third Teacher directly via TTEN's official evaluator."""
-    tten_metrics = _load_tten_metrics()
-    device = tt["i_good"].device
-    tail_mask = _tail_item_mask(item_pop).to(device)
-    pop_cpu = item_pop.cpu().numpy()
-
-    test_users = sorted(test_sets.keys())
-    all_user_num, all_hr, all_recall, all_ndcg = 0, 0.0, 0.0, 0.0
-    arps, tails = [], []
-
-    for start in range(0, len(test_users), batch_size):
-        batch_u = test_users[start : start + batch_size]
-        u_t = torch.tensor(batch_u, dtype=torch.long, device=device)
-
+def make_third_teacher_score_fn(tt, ref_mode, gamma):
+    """Returns a batched score_fn(u_tensor) -> [B, num_items] for any bias metric suite."""
+    @torch.no_grad()
+    def _score_fn(u_t):
         s_g = torch.matmul(tt["u_good"][u_t], tt["i_good"].t())
         s_e = torch.matmul(tt["u_evil"][u_t], tt["i_evil"].t())
-        scores = compute_ref_scores(
+        return compute_ref_scores(
             s_g,
             s_e,
             ref_mode,
@@ -172,27 +158,4 @@ def evaluate_third_teacher(tt, train_sets, test_sets, item_pop, ref_mode, gamma,
             tt["mean_e"][u_t],
             tt["std_e"][u_t],
         )
-        _mask_seen_items_(scores, batch_u, train_sets)
-
-        _, topk_idx = torch.topk(scores, k=k, dim=1)
-        topk_cpu = topk_idx.cpu().numpy()
-
-        user_num, _, _, hr_sum, rec_sum, ndcg_sum = tten_metrics(batch_u, topk_cpu, k, test_sets)
-        all_user_num += user_num
-        all_hr += hr_sum
-        all_recall += rec_sum
-        all_ndcg += ndcg_sum
-
-        tail_hits = tail_mask[topk_idx].float().mean(dim=1).cpu().numpy()
-        for row_idx in range(len(batch_u)):
-            arps.append(pop_cpu[topk_cpu[row_idx]].mean())
-            tails.append(float(tail_hits[row_idx]))
-
-    denom = max(1, all_user_num)
-    return {
-        f"HR@{k}": float(all_hr / denom),
-        f"Recall@{k}": float(all_recall / denom),
-        f"NDCG@{k}": float(all_ndcg / denom),
-        f"ARP@{k}": float(np.mean(arps)),
-        f"Tail@{k}": float(np.mean(tails)),
-    }
+    return _score_fn
