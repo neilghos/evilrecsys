@@ -236,7 +236,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Debiased Student with Third-Teacher KD")
     parser.add_argument("--data_root", type=str, default="PopBias/Data")
     parser.add_argument("--fair_data_root", type=str, default="")
-    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m"])
+    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m", "addressa", "globe"])
     parser.add_argument("--good_ckpt", type=str, default="checkpoints_fair_2k/baseline_gowalla.pt")
     parser.add_argument("--evil_ckpt", type=str, default="checkpoints_fair_2k/evil_a1.0_b1.0_gowalla.pt")
     parser.add_argument("--ref_mode", type=str, default="swiglu", choices=list(VALID_REF_MODES))

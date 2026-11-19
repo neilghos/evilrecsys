@@ -10,7 +10,7 @@ from teacher import build_third_teacher, evaluate_third_teacher, load_frozen_tea
 def main():
     parser = argparse.ArgumentParser(description="Sweep gated Third-Teacher modes (SiLU/SwiGLU) and gammas")
     parser.add_argument("--data_root", type=str, default="PopBias/Data")
-    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m"])
+    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m", "addressa", "globe"])
     parser.add_argument("--good_ckpt", type=str, default="checkpoints_fair_2k/baseline_gowalla.pt")
     parser.add_argument("--evil_ckpt", type=str, default="checkpoints_fair_2k/evil_a1.0_b1.0_gowalla.pt")
     parser.add_argument("--modes", type=str, default="silu,swiglu")

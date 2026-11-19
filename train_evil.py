@@ -220,7 +220,7 @@ def train_evil(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Baseline or Evil LightGCN (exact LightGCN-PyTorch setup)")
     parser.add_argument("--data_root", type=str, default="PopBias/Data")
-    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m"])
+    parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018", "ml_10m", "addressa", "globe"])
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
