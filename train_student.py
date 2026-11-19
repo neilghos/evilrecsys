@@ -3,72 +3,59 @@ import os
 import time
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from dataloaders import build_sparse_adj_matrix, load_cf_txt_dataset
 from evil_model import EvilLightGCN
 from metrics import evaluate_cf
+from third_teacher import VALID_REF_MODES, build_third_teacher, compute_ref_scores, load_frozen_teacher
 from train_evil import FastLightGCNSampler, _maybe_to_csr
 
 
-@torch.no_grad()
-def load_frozen_teacher(ckpt_path, adj, num_users, device):
-    ckpt = torch.load(ckpt_path, map_location=device)
-    c_args = ckpt["args"]
-    teacher = EvilLightGCN(
-        num_nodes=ckpt["num_nodes"],
-        embedding_dim=c_args["dim"],
-        num_layers=c_args["layers"],
-    ).to(device)
-    teacher.load_state_dict(ckpt["state_dict"])
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    emb = teacher(adj).detach()
-    return emb[:num_users], emb[num_users:]
+def _zscore(x):
+    return (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True).clamp(min=1e-6)
 
 
-def kd_third_teacher(u, cand_items, u_stu, i_stu, u_good, i_good, u_evil, i_evil, gamma, tau, scale_teachers=False):
-    """
-    Distills evil-referenced teacher scores: s_ref = s_good - gamma * s_evil
-    into the student over candidate items [B, M].
-    """
-    # u_*: [B, D], i_*[cand_items]: [B, M, D]
+def sample_candidates(u, pos_i, neg_i, num_items, ref_topk, evil_topk, n_ref_sample, n_evil_sample, num_cands, device):
+    """Builds per-user candidate list mixing positives, negatives, teacher-mined hard items, and randoms."""
+    parts = [pos_i.unsqueeze(1), neg_i.unsqueeze(1)]
+    bsz = len(u)
+    if n_ref_sample > 0 and ref_topk is not None:
+        idx = torch.randint(0, ref_topk.size(1), (bsz, n_ref_sample), device=device)
+        parts.append(torch.gather(ref_topk[u], 1, idx))
+    if n_evil_sample > 0 and evil_topk is not None:
+        idx = torch.randint(0, evil_topk.size(1), (bsz, n_evil_sample), device=device)
+        parts.append(torch.gather(evil_topk[u], 1, idx))
+    if num_cands > 0:
+        parts.append(torch.randint(0, num_items, (bsz, num_cands), device=device))
+    return torch.cat(parts, dim=1)
+
+
+def kd_third_teacher(u, cand_items, u_stu, i_stu, tt, ref_mode, gamma, tau, scale_student=True):
+    """Distills frozen Third-Teacher scores into the student over candidate items [B, M]."""
     s_stu = torch.bmm(i_stu[cand_items], u_stu.unsqueeze(-1)).squeeze(-1)
     with torch.no_grad():
-        s_good = torch.bmm(i_good[cand_items], u_good[u].unsqueeze(-1)).squeeze(-1)
-        s_evil = torch.bmm(i_evil[cand_items], u_evil[u].unsqueeze(-1)).squeeze(-1)
-        if scale_teachers:
-            s_good = (s_good - s_good.mean(dim=-1, keepdim=True)) / s_good.std(dim=-1, keepdim=True).clamp(min=1e-6)
-            s_evil = (s_evil - s_evil.mean(dim=-1, keepdim=True)) / s_evil.std(dim=-1, keepdim=True).clamp(min=1e-6)
-        s_ref = s_good - gamma * s_evil
+        s_g = torch.bmm(tt["i_good"][cand_items], tt["u_good"][u].unsqueeze(-1)).squeeze(-1)
+        s_e = torch.bmm(tt["i_evil"][cand_items], tt["u_evil"][u].unsqueeze(-1)).squeeze(-1)
+        s_ref = compute_ref_scores(
+            s_g,
+            s_e,
+            ref_mode,
+            gamma,
+            mean_g=tt["mean_g"][u],
+            std_g=tt["std_g"][u],
+            mean_e=tt["mean_e"][u],
+            std_e=tt["std_e"][u],
+            beta_u=tt["beta_u"][u],
+        )
+        if scale_student:
+            s_ref = _zscore(s_ref)
         p_ref = F.softmax(s_ref / tau, dim=-1)
 
+    if scale_student:
+        s_stu = _zscore(s_stu)
     log_p_stu = F.log_softmax(s_stu / tau, dim=-1)
     return F.kl_div(log_p_stu, p_ref, reduction="batchmean") * (tau ** 2)
-
-
-def kd_contrastive(u, u_stu, u_good, u_evil, tau):
-    """
-    InfoNCE contrastive KD: pulls normalized student user embedding toward
-    good teacher u_good[u], and pushes away from evil teacher u_evil[u]
-    plus in-batch negatives.
-    """
-    z_stu = F.normalize(u_stu, dim=-1)
-    z_pos = F.normalize(u_good[u], dim=-1)
-    z_evil = F.normalize(u_evil[u], dim=-1)
-
-    pos_sim = (z_stu * z_pos).sum(dim=-1, keepdim=True) / tau          # [B, 1]
-    evil_sim = (z_stu * z_evil).sum(dim=-1, keepdim=True) / tau        # [B, 1]
-    inbatch_sim = torch.matmul(z_stu, z_pos.t()) / tau                 # [B, B]
-    # Mask self-similarity on diagonal so pos isn't double-counted in denominator
-    eye_mask = torch.eye(z_stu.size(0), dtype=torch.bool, device=z_stu.device)
-    inbatch_sim = inbatch_sim.masked_fill(eye_mask, -1e9)
-
-    logits = torch.cat([pos_sim, evil_sim, inbatch_sim], dim=1)        # [B, 2 + B]
-    targets = torch.zeros(z_stu.size(0), dtype=torch.long, device=z_stu.device)
-    return F.cross_entropy(logits, targets)
 
 
 def train_student(args):
@@ -93,6 +80,18 @@ def train_student(args):
 
     u_evil, i_evil = load_frozen_teacher(args.evil_ckpt, adj, num_users, device)
     u_good, i_good = load_frozen_teacher(args.good_ckpt, adj, num_users, device)
+    tt = build_third_teacher(
+        u_good,
+        i_good,
+        u_evil,
+        i_evil,
+        ref_mode=args.ref_mode,
+        gamma=args.gamma,
+        train_sets=data["train_sets"],
+        topk_ref=args.topk_ref,
+        topk_evil=args.topk_evil,
+    )
+    ref_topk, evil_topk = tt["ref_topk"], tt["evil_topk"]
 
     student = EvilLightGCN(num_nodes=num_nodes, embedding_dim=args.dim, num_layers=args.layers).to(device)
     optimizer = torch.optim.Adam(student.parameters(), lr=args.lr)
@@ -101,9 +100,14 @@ def train_student(args):
         data["train_sets"], num_users, num_items, data["item_pop"], device=device, alpha=0.0
     )
 
+    os.makedirs(args.save_dir, exist_ok=True)
+    best_recall = -1.0
+    best_ckpt_path = os.path.join(args.save_dir, f"student_third_teacher_{args.dataset}_best.pt")
+
     print(
-        f"[Student-{args.method}] dataset={args.dataset} kd_weight={args.kd_weight} "
-        f"gamma={args.gamma} tau={args.tau} device={device}"
+        f"[Student-ThirdTeacher] dataset={args.dataset} ref_mode={args.ref_mode} "
+        f"gamma={args.gamma} kd_weight={args.kd_weight} bpr_weight={args.bpr_weight} "
+        f"tau={args.tau} scale_student={args.scale_student} device={device}"
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -144,19 +148,31 @@ def train_student(args):
                 + student.embedding.weight[neg_idx].pow(2).sum()
             ) / float(len(u))
 
-            if args.method == "third_teacher":
-                rand_cands = torch.randint(0, num_items, (len(u), args.num_cands), device=device)
-                cand_items = torch.cat([pos_i.unsqueeze(1), neg_i.unsqueeze(1), rand_cands], dim=1)
-                kd_loss = kd_third_teacher(
-                    u, cand_items, u_e, i_all_stu, u_good, i_good, u_evil, i_evil,
-                    args.gamma, args.tau, scale_teachers=args.scale_teachers,
-                )
-            elif args.method == "contrastive":
-                kd_loss = kd_contrastive(u, u_e, u_good, u_evil, args.tau)
-            else:
-                raise ValueError(f"Unknown method: {args.method}")
+            cand_items = sample_candidates(
+                u,
+                pos_i,
+                neg_i,
+                num_items,
+                ref_topk,
+                evil_topk,
+                args.n_ref_sample,
+                args.n_evil_sample,
+                args.num_cands,
+                device,
+            )
+            kd_loss = kd_third_teacher(
+                u,
+                cand_items,
+                u_e,
+                i_all_stu,
+                tt,
+                args.ref_mode,
+                args.gamma,
+                args.tau,
+                scale_student=args.scale_student,
+            )
 
-            loss = bpr_loss + args.reg * reg_loss + args.kd_weight * kd_loss
+            loss = args.bpr_weight * bpr_loss + args.reg * reg_loss + args.kd_weight * kd_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -173,11 +189,10 @@ def train_student(args):
             with torch.no_grad():
                 final_emb = student(adj)
                 u_emb, i_emb = final_emb[:num_users], final_emb[num_users:]
-                res_iid = evaluate_cf(
+                res_main = evaluate_cf(
                     u_emb, i_emb, data["train_sets"], data["test_sets"], data["item_pop"], k=args.topk
                 )
-                iid_str = " ".join(f"{k}={v:.4f}" for k, v in res_iid.items())
-                msg = f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f} | IID: {iid_str}"
+                main_str = " ".join(f"{k}={v:.4f}" for k, v in res_main.items())
 
                 if fair_data is not None:
                     res_fair = evaluate_cf(
@@ -188,39 +203,53 @@ def train_student(args):
                         fair_data["item_pop"],
                         k=args.topk,
                     )
-                    fair_str = f"Recall@{args.topk}={res_fair[f'Recall@{args.topk}']:.4f} NDCG@{args.topk}={res_fair[f'NDCG@{args.topk}']:.4f}"
-                    msg += f" | Fair: {fair_str}"
+                    fair_str = " ".join(f"{k}={v:.4f}" for k, v in res_fair.items())
+                    msg = f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f} | IID: {main_str} | Fair: {fair_str}"
+                    tracked_recall = res_fair[f"Recall@{args.topk}"]
+                else:
+                    msg = f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f} | Eval: {main_str}"
+                    tracked_recall = res_main[f"Recall@{args.topk}"]
+
+                if tracked_recall > best_recall:
+                    best_recall = tracked_recall
+                    torch.save({"state_dict": student.state_dict(), "args": vars(args)}, best_ckpt_path)
+                    msg += " *"
                 print(msg)
         else:
             print(f"Epoch {epoch:04d} ({dt:.1f}s) | loss={avg_loss:.4f} kd={avg_kd:.4f}")
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.save_dir, f"student_{args.method}_{args.dataset}.pt")
+    ckpt_path = os.path.join(args.save_dir, f"student_third_teacher_{args.dataset}.pt")
     torch.save({"state_dict": student.state_dict(), "args": vars(args)}, ckpt_path)
-    print(f"Saved Student checkpoint to {ckpt_path}")
+    print(f"Saved Student checkpoint to {ckpt_path} (best Recall@{args.topk}={best_recall:.4f} at {best_ckpt_path})")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Debiased Student with Evil-Teacher KD")
-    parser.add_argument("--data_root", type=str, default="PopBias/Baselines/LightGCN-PyTorch/data")
-    parser.add_argument("--fair_data_root", type=str, default="PopBias/Data")
+    parser = argparse.ArgumentParser(description="Train Debiased Student with Third-Teacher KD")
+    parser.add_argument("--data_root", type=str, default="PopBias/Data")
+    parser.add_argument("--fair_data_root", type=str, default="")
     parser.add_argument("--dataset", type=str, default="gowalla", choices=["gowalla", "yelp2018"])
-    parser.add_argument("--good_ckpt", type=str, default="checkpoints/baseline_gowalla.pt")
-    parser.add_argument("--evil_ckpt", type=str, default="checkpoints/evil_a1.0_b1.0_gowalla.pt")
-    parser.add_argument("--method", type=str, default="third_teacher", choices=["third_teacher", "contrastive"])
-    parser.add_argument("--kd_weight", type=float, default=0.5)
-    parser.add_argument("--gamma", type=float, default=0.5, help="Evil subtraction weight for third_teacher")
-    parser.add_argument("--tau", type=float, default=0.2, help="Temperature for KD / InfoNCE")
-    parser.add_argument("--num_cands", type=int, default=32, help="Extra random candidates per batch for third_teacher")
-    parser.add_argument("--scale_teachers", action="store_true", help="Z-score s_good and s_evil per user before subtracting")
+    parser.add_argument("--good_ckpt", type=str, default="checkpoints_fair_2k/baseline_gowalla.pt")
+    parser.add_argument("--evil_ckpt", type=str, default="checkpoints_fair_2k/evil_a1.0_b1.0_gowalla.pt")
+    parser.add_argument("--ref_mode", type=str, default="orth", choices=list(VALID_REF_MODES))
+    parser.add_argument("--gamma", type=float, default=1.0, help="Evil subtraction weight for Third Teacher")
+    parser.add_argument("--tau", type=float, default=0.2, help="Temperature for Third-Teacher KL")
+    parser.add_argument("--kd_weight", type=float, default=1.5)
+    parser.add_argument("--bpr_weight", type=float, default=0.5)
+    parser.add_argument("--topk_ref", type=int, default=64, help="Top-K items mined from Third Teacher per user")
+    parser.add_argument("--topk_evil", type=int, default=32, help="Top-K bias traps mined from Evil Teacher per user")
+    parser.add_argument("--n_ref_sample", type=int, default=32, help="Ref-teacher hard positives sampled per batch")
+    parser.add_argument("--n_evil_sample", type=int, default=16, help="Evil-teacher bias traps sampled per batch")
+    parser.add_argument("--num_cands", type=int, default=64, help="Extra random background candidates per batch")
+    parser.add_argument("--scale_student", action="store_true", default=True, help="Z-score student and ref logits before KL")
+    parser.add_argument("--no_scale_student", dest="scale_student", action="store_false")
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--reg", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--eval_every", type=int, default=20)
+    parser.add_argument("--eval_every", type=int, default=50)
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2020)
-    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--save_dir", type=str, default="checkpoints_fair_v2")
     train_student(parser.parse_args())
